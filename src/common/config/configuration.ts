@@ -1,3 +1,4 @@
+import { EmbeddingModel } from '../../knowledgebase/knowledgebase.schema';
 import { Subscription } from '../../user/user.schema';
 
 interface AppConfig {
@@ -11,8 +12,14 @@ interface AppConfig {
   redisHost?: string;
   redisPort?: number;
   redisUrl?: string;
+  defaultEmbeddingsModel?: string
+  defaultChatModel?: string
+  aiProvider: 'openai' | 'openai-azure'
   openaiKey: string;
   openaiKey2: string;
+  openaiAzureEndpoint: string;
+  openaiAzureKey: string;
+  openaiAzureVersion: string;
   googleClientId: string;
   lemonSqueezyApiKey: string;
   lemonSqueezySignSecret: string;
@@ -38,8 +45,14 @@ const config = (): AppConfig => ({
   redisHost: process.env.REDIS_HOST || 'localhost',
   redisPort: parseInt(process.env.REDIS_PORT as string, 10) || 6379,
   redisUrl: process.env.REDIS_URL,
+  defaultEmbeddingsModel: process.env.DEFAULT_EMBEDDINGS_MODEL || EmbeddingModel.OPENAI_EMBEDDING_3,
+  defaultChatModel: process.env.DEFAULT_CHAT_MODEL || 'gpt-3.5-turbo',
+  aiProvider: (process.env.AI_PROVIDER || 'openai') as AppConfig['aiProvider'],
   openaiKey: process.env.OPENAI_KEY || '',
   openaiKey2: process.env.OPENAI_KEY_2 || '',
+  openaiAzureEndpoint: process.env.OPENAI_AZURE_ENDPOINT || '',
+  openaiAzureKey: process.env.OPENAI_AZURE_KEY || '',
+  openaiAzureVersion: process.env.OPENAI_AZURE_VERSION || '',
   googleClientId: process.env.GOOGLE_CLIENT_ID || '',
   lemonSqueezyApiKey: process.env.LEMON_SQUEEZY_API_KEY || '',
   lemonSqueezySignSecret: process.env.LEMON_SQUEEZY_SIGN_SECRET || '',

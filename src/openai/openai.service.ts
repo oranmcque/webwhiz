@@ -1,15 +1,22 @@
 import { Injectable, Logger } from '@nestjs/common';
-import axios from 'axios';
-import { Configuration, CreateChatCompletionRequest, OpenAIApi } from 'openai';
+import OpenAI, { AzureOpenAI } from 'openai';
 import { RateLimiterMemory } from 'rate-limiter-flexible';
 import { Subject } from 'rxjs';
 import { AppConfigService } from '../common/config/appConfig.service';
 import * as tiktoken from '@dqbd/tiktoken';
 import { createHash } from 'node:crypto';
 import { EmbeddingModel } from '../knowledgebase/knowledgebase.schema';
+import { APIError } from 'openai/error';
 
 const TOKENIZERS = {
   chatgtp: tiktoken.encoding_for_model('gpt-3.5-turbo'),
+};
+
+const keyHashCache: Record<string, string> = {};
+const keyHash = (key: string) => {
+  if (keyHashCache[key]) return keyHashCache[key];
+
+  return (keyHashCache[key] = createHash('md5').update(key).digest('hex'));
 };
 
 export interface ChatGTPResponse {
@@ -21,19 +28,42 @@ export interface ChatGTPResponse {
   };
 }
 
-export type ChatGptPromptMessages = CreateChatCompletionRequest['messages'];
+export type ChatGptPromptMessages =
+  OpenAI.Chat.ChatCompletionCreateParamsNonStreaming['messages'];
 
-function getOpenAiClient(keys: string[]): [OpenAIApi, string, string] {
-  // Select random key from the given list of keys
-  const randomKeyIdx = Math.floor(Math.random() * keys.length);
-  const selectedKey = keys[randomKeyIdx];
-  const selectedKeyHash = createHash('md5').update(selectedKey).digest('hex');
+type OpenAICredentials = {
+  type: 'openai';
+  keys: string[];
+};
 
-  const config = new Configuration({
-    apiKey: selectedKey,
-  });
-  const client = new OpenAIApi(config);
-  return [client, selectedKey, selectedKeyHash];
+type OpenAIAzureCredentials = {
+  type: 'openai-azure';
+  endpoint: string;
+  version: string;
+  key: string;
+};
+
+export type AICredentials = OpenAICredentials | OpenAIAzureCredentials;
+
+function getOpenAiClient(credentials: AICredentials): OpenAI {
+  switch (credentials.type) {
+    case 'openai': {
+      const { keys } = credentials;
+
+      // Select random key from the given list of keys
+      const randomKeyIdx = Math.floor(Math.random() * keys.length);
+      const selectedKey = keys[randomKeyIdx];
+
+      return new OpenAI({ apiKey: selectedKey });
+    }
+    case 'openai-azure': {
+      return new AzureOpenAI({
+        endpoint: credentials.endpoint,
+        apiKey: credentials.key,
+        apiVersion: credentials.version,
+      });
+    }
+  }
 }
 
 @Injectable()
@@ -41,13 +71,28 @@ export class OpenaiService {
   private readonly logger: Logger;
   private readonly rateLimiter: RateLimiterMemory;
   private readonly embedRateLimiter: RateLimiterMemory;
-  private readonly defaultKeys = [];
+  private readonly defaultCredentials: AICredentials;
 
   constructor(private appConfig: AppConfigService) {
-    this.defaultKeys = [
-      this.appConfig.get('openaiKey'),
-      this.appConfig.get('openaiKey2'),
-    ];
+    switch (this.appConfig.get('aiProvider')) {
+      case 'openai':
+        this.defaultCredentials = {
+          type: 'openai',
+          keys: [
+            this.appConfig.get('openaiKey'),
+            this.appConfig.get('openaiKey2'),
+          ],
+        };
+        break;
+      case 'openai-azure':
+        this.defaultCredentials = {
+          type: 'openai-azure',
+          endpoint: this.appConfig.get('openaiAzureEndpoint'),
+          key: this.appConfig.get('openaiAzureKey'),
+          version: this.appConfig.get('openaiAzureVersion'),
+        };
+        break;
+    }
 
     this.logger = new Logger(OpenaiService.name);
 
@@ -76,16 +121,19 @@ export class OpenaiService {
    */
   async getEmbedding(
     input: string,
-    keys?: string[],
+    credentials?: AICredentials,
     model: EmbeddingModel = EmbeddingModel.OPENAI_EMBEDDING_2,
   ): Promise<number[] | undefined> {
     // Get openAi client from the given keys
-    keys = keys || this.defaultKeys;
-    const [openAiClient, _, openAiKeyHash] = getOpenAiClient(keys);
+    credentials = credentials || this.defaultCredentials;
+    const openAiClient = getOpenAiClient(credentials);
 
     // Rate limiter check
     try {
-      await this.embedRateLimiter.consume(`openai-emd-${openAiKeyHash}`, 1);
+      await this.embedRateLimiter.consume(
+        `openai-emd-${keyHash(openAiClient.apiKey)}`,
+        1,
+      );
     } catch (err) {
       this.logger.error('OpenAI Embedding Request exceeded rate limiting');
       throw new Error('Requests exceeded maximum rate');
@@ -93,11 +141,11 @@ export class OpenaiService {
 
     // API Call
     try {
-      const res = await openAiClient.createEmbedding({
+      const res = await openAiClient.embeddings.create({
         input,
         model: model,
       });
-      return res.data.data?.[0].embedding;
+      return res.data?.[0].embedding;
     } catch (err) {
       this.logger.error('OpenAI Embedding API error', err);
       this.logger.error('Error reponse', err?.response?.data);
@@ -112,16 +160,19 @@ export class OpenaiService {
    * @returns
    */
   async getChatGptCompletion(
-    data: CreateChatCompletionRequest,
-    keys?: string[],
+    data: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
+    credentials?: AICredentials,
   ): Promise<ChatGTPResponse> {
     // Get openAi client from the given keys
-    keys = keys || this.defaultKeys;
-    const [openAiClient, _, openAiKeyHash] = getOpenAiClient(keys);
+    credentials = credentials || this.defaultCredentials;
+    const openAiClient = getOpenAiClient(credentials);
 
     // Rate limiter check
     try {
-      await this.rateLimiter.consume(`openai-req-${openAiKeyHash}`, 1);
+      await this.rateLimiter.consume(
+        `openai-req-${keyHash(openAiClient.apiKey)}`,
+        1,
+      );
     } catch (err) {
       this.logger.error('OpenAI ChatCompletion Request exeeced rate limiting');
       throw new Error('Requests exceeded maximum rate');
@@ -129,13 +180,13 @@ export class OpenaiService {
 
     // API Call
     try {
-      const res = await openAiClient.createChatCompletion(data);
+      const res = await openAiClient.chat.completions.create(data);
       return {
-        response: res.data.choices[0].message.content,
+        response: res.choices[0].message.content,
         tokenUsage: {
-          prompt: res.data.usage?.prompt_tokens,
-          completion: res.data.usage?.completion_tokens,
-          total: res.data.usage?.total_tokens,
+          prompt: res.usage?.prompt_tokens,
+          completion: res.usage?.completion_tokens,
+          total: res.usage?.total_tokens,
         },
       };
     } catch (err) {
@@ -152,73 +203,52 @@ export class OpenaiService {
    * @returns
    */
   async getChatGptCompletionStream(
-    data: CreateChatCompletionRequest,
+    data: OpenAI.Chat.ChatCompletionCreateParamsStreaming,
     completeCb?: (
       answer: string,
       usage: ChatGTPResponse['tokenUsage'],
     ) => Promise<void>,
-    keys?: string[],
+    credentials?: AICredentials,
   ) {
     // Get openAi client from the given keys
-    keys = keys || this.defaultKeys;
-    const [_, openAiKey, openAiKeyHash] = getOpenAiClient(keys);
+    credentials = credentials || this.defaultCredentials;
+    const openAiClient = getOpenAiClient(credentials);
 
     // Rate limiter check
     try {
-      await this.rateLimiter.consume(`openai-req-${openAiKeyHash}`, 1);
+      await this.rateLimiter.consume(
+        `openai-req-${keyHash(openAiClient.apiKey)}`,
+        1,
+      );
     } catch (err) {
       this.logger.error('OpenAI ChatCompletion Request exeeced rate limiting');
       throw new Error('Requests exceeded maximum rate');
     }
 
     const observable = new Subject<string>();
-
     const promptTokens = this.getTokenCount(
       data.messages.map((m) => m.content).join(' '),
     );
 
     try {
-      const res = await axios.post(
-        'https://api.openai.com/v1/chat/completions',
-        { ...data, stream: true },
-        {
-          responseType: 'stream',
-          headers: {
-            Authorization: `Bearer ${openAiKey}`,
-          },
-        },
-      );
-
-      const stream = res.data;
+      const completionStream = await openAiClient.chat.completions.create(data);
 
       let answer = '';
-      let buffer = '';
 
-      stream.on('data', (data) => {
-        const dataStr = buffer.length
-          ? buffer + data.toString()
-          : data.toString();
-        const responses = dataStr.split('\n\n').filter((c) => c.length > 0);
+      const streamPromise = new Promise(async (res) => {
+        for await (const part of completionStream) {
+          const { content } = part.choices[0].delta;
 
-        for (const res of responses) {
-          try {
-            if (res === 'data: [DONE]') continue;
-            const content = JSON.parse(res.replace('data: ', '')).choices[0]
-              ?.delta?.content;
-            if (content !== undefined) {
-              observable.next(JSON.stringify({ content }));
-              answer += content;
-            }
-            buffer = '';
-          } catch {
-            console.log('Error', res);
-            buffer += res;
+          if (content !== undefined) {
+            observable.next(JSON.stringify({ content }));
+            answer += content;
           }
         }
+
+        res(true);
       });
 
-      stream.on('end', () => {
-        observable.next('[DONE]');
+      streamPromise.then(() => {
         observable.complete();
         const completionTokens = this.getTokenCount(answer);
         completeCb?.(answer, {
@@ -227,20 +257,13 @@ export class OpenaiService {
           total: promptTokens + completionTokens,
         });
       });
-    } catch (err) {
-      this.logger.error('OpenAI ChatCompletion API error', err);
-      let errorString = '';
-      err.response.data.setEncoding('utf8');
-      err.response.data
-        .on('data', (utf8Chunk) => {
-          errorString += utf8Chunk;
-        })
-        .on('end', () => {
-          this.logger.error('Error response', errorString);
-        });
-      throw err;
+    } catch (error) {
+      if (APIError.isPrototypeOf(error)) {
+        this.logger.error('OpenAI ChatCompletion API error', error);
+        this.logger.error('Error response', error.data);
+      }
+      throw error;
     }
-
     return observable;
   }
 }
