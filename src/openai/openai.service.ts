@@ -249,6 +249,7 @@ export class OpenaiService {
       });
 
       streamPromise.then(() => {
+        observable.next('[DONE]');
         observable.complete();
         const completionTokens = this.getTokenCount(answer);
         completeCb?.(answer, {
